@@ -60,6 +60,14 @@ CU = _env_str("CU", CU)
 CT = _env_str("CT", CT)
 CM = _env_str("CM", CM)
 
+def parse_cli_args(arguments):
+    overrides = {}
+    for argument in arguments:
+        key, separator, value = argument.partition('=')
+        if separator and key in {'SERVER', 'PORT', 'USER', 'PASSWORD', 'INTERVAL'}:
+            overrides[key] = value
+    return overrides
+
 def get_uptime():
     with open('/proc/uptime', 'r') as f:
         uptime = f.readline().split('.', 2)
@@ -133,6 +141,111 @@ def get_cpu():
     result = 100-(t[len(t)-1]*100.00/st)
     return round(result, 1)
 
+def get_cpu_cores():
+    try:
+        with open('/proc/stat') as f:
+            cores = sum(1 for line in f if re.match(r'^cpu\d+\s', line))
+        if cores > 0:
+            return cores
+    except Exception:
+        pass
+    return os.cpu_count() or 0
+
+def normalize_cpu_model(value):
+    return re.sub(r'\s+', ' ', str(value or '')).strip()[:160]
+
+def is_generic_cpu_model(value):
+    v = normalize_cpu_model(value).lower().replace('-', '').replace('_', '').replace(' ', '')
+    return v in ('', 'unknown', 'x8664', 'amd64', 'i386', 'i686', 'aarch64', 'arm64') or v.startswith('armv')
+
+def get_lscpu_info():
+    result = {}
+    try:
+        output = subprocess.check_output(['lscpu'], stderr=subprocess.DEVNULL, timeout=2).decode(errors='ignore')
+        for line in output.splitlines():
+            if ':' not in line:
+                continue
+            key, value = line.split(':', 1)
+            key = key.strip().lower()
+            value = normalize_cpu_model(value)
+            if value and key not in result:
+                result[key] = value
+    except Exception:
+        pass
+    return result
+
+def get_cpuinfo_values():
+    result = {}
+    try:
+        with open('/proc/cpuinfo') as f:
+            for line in f:
+                if ':' not in line:
+                    continue
+                key, value = line.split(':', 1)
+                key = key.strip().lower()
+                value = normalize_cpu_model(value)
+                if value and key not in result:
+                    result[key] = value
+    except Exception:
+        pass
+    return result
+
+def get_cpu_model():
+    cpuinfo = get_cpuinfo_values()
+    lscpu = get_lscpu_info()
+    for value in (
+        cpuinfo.get('model name'),
+        lscpu.get('model name'),
+        cpuinfo.get('hardware'),
+        cpuinfo.get('processor'),
+        platform.processor(),
+    ):
+        value = normalize_cpu_model(value)
+        if value and not value.isdigit() and not is_generic_cpu_model(value):
+            return value
+    vendor = normalize_cpu_model(lscpu.get('vendor id') or cpuinfo.get('vendor_id'))
+    if vendor:
+        return vendor
+    return normalize_cpu_model(lscpu.get('architecture') or platform.machine() or platform.processor())
+
+def get_os_name():
+    try:
+        sysname = platform.system().lower()
+        if sysname.startswith('linux'):
+            os_name = 'linux'
+            try:
+                with open('/etc/os-release') as f:
+                    for line in f:
+                        if line.startswith('ID='):
+                            value = line.strip().split('=', 1)[1].strip().strip('"')
+                            if value:
+                                os_name = value
+                            break
+            except Exception:
+                pass
+            return os_name
+        if sysname.startswith('darwin'):
+            return 'darwin'
+        if sysname.startswith('freebsd'):
+            return 'freebsd'
+        if sysname.startswith('openbsd'):
+            return 'openbsd'
+        if sysname.startswith('netbsd'):
+            return 'netbsd'
+        return sysname or 'unknown'
+    except Exception:
+        return 'unknown'
+
+def is_ignored_network_interface(name):
+    name = str(name or '').strip().lower()
+    is_loopback = (
+        name == 'lo'
+        or (name.startswith('lo') and name[2:].isdigit())
+        or name.startswith('loopback')
+    )
+    virtual_prefixes = ('tun', 'docker', 'veth', 'br-', 'vmbr', 'vnet', 'kube')
+    return not name or is_loopback or name.startswith(virtual_prefixes)
+
 def liuliang():
     NET_IN = 0
     NET_OUT = 0
@@ -140,11 +253,7 @@ def liuliang():
         for line in f.readlines():
             netinfo = re.findall(r'([^\s]+):[\s]{0,}(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)', line)
             if netinfo:
-                if netinfo[0][0] == 'lo' or 'tun' in netinfo[0][0] \
-                        or 'docker' in netinfo[0][0] or 'veth' in netinfo[0][0] \
-                        or 'br-' in netinfo[0][0] or 'vmbr' in netinfo[0][0] \
-                        or 'vnet' in netinfo[0][0] or 'kube' in netinfo[0][0] \
-                        or netinfo[0][1]=='0' or netinfo[0][9]=='0':
+                if is_ignored_network_interface(netinfo[0][0]):
                     continue
                 else:
                     NET_IN += int(netinfo[0][1])
@@ -201,6 +310,22 @@ diskIO = {
 }
 monitorServer = {}
 
+def update_net_speed(avgrx, avgtx, now_clock=None):
+    if now_clock is None:
+        now_clock = time.monotonic()
+    previous_clock = netSpeed.get("clock", 0.0)
+    previous_rx = netSpeed.get("avgrx", 0)
+    previous_tx = netSpeed.get("avgtx", 0)
+    diff = now_clock - previous_clock
+    initialized = previous_clock > 0 and diff > 0
+    netSpeed["diff"] = diff if initialized else 0.0
+    netSpeed["clock"] = now_clock
+    netSpeed["netrx"] = int((avgrx - previous_rx) / diff) if initialized and avgrx >= previous_rx else 0
+    netSpeed["nettx"] = int((avgtx - previous_tx) / diff) if initialized and avgtx >= previous_tx else 0
+    netSpeed["avgrx"] = avgrx
+    netSpeed["avgtx"] = avgtx
+    return netSpeed["netrx"], netSpeed["nettx"]
+
 def _ping_thread(host, mark, port):
     lostPacket = 0
     packet_queue = Queue(maxsize=PING_PACKET_HISTORY_LEN)
@@ -247,21 +372,12 @@ def _net_speed():
             avgtx = 0
             for dev in net_dev[2:]:
                 dev = dev.split(':')
-                if "lo" in dev[0] or "tun" in dev[0] \
-                        or "docker" in dev[0] or "veth" in dev[0] \
-                        or "br-" in dev[0] or "vmbr" in dev[0] \
-                        or "vnet" in dev[0] or "kube" in dev[0]:
+                if is_ignored_network_interface(dev[0]):
                     continue
                 dev = dev[1].split()
                 avgrx += int(dev[0])
                 avgtx += int(dev[8])
-            now_clock = time.time()
-            netSpeed["diff"] = now_clock - netSpeed["clock"]
-            netSpeed["clock"] = now_clock
-            netSpeed["netrx"] = int((avgrx - netSpeed["avgrx"]) / netSpeed["diff"])
-            netSpeed["nettx"] = int((avgtx - netSpeed["avgtx"]) / netSpeed["diff"])
-            netSpeed["avgrx"] = avgrx
-            netSpeed["avgtx"] = avgtx
+            update_net_speed(avgrx, avgtx)
         time.sleep(INTERVAL)
 
 def _disk_io():
@@ -442,17 +558,12 @@ def byte_str(object):
         print(type(object))
 
 if __name__ == '__main__':
-    for argc in sys.argv:
-        if 'SERVER' in argc:
-            SERVER = argc.split('SERVER=')[-1]
-        elif 'PORT' in argc:
-            PORT = int(argc.split('PORT=')[-1])
-        elif 'USER' in argc:
-            USER = argc.split('USER=')[-1]
-        elif 'PASSWORD' in argc:
-            PASSWORD = argc.split('PASSWORD=')[-1]
-        elif 'INTERVAL' in argc:
-            INTERVAL = int(argc.split('INTERVAL=')[-1])
+    cli_args = parse_cli_args(sys.argv[1:])
+    SERVER = cli_args.get('SERVER', SERVER)
+    PORT = int(cli_args.get('PORT', PORT))
+    USER = cli_args.get('USER', USER)
+    PASSWORD = cli_args.get('PASSWORD', PASSWORD)
+    INTERVAL = int(cli_args.get('INTERVAL', INTERVAL))
     socket.setdefaulttimeout(30)
     get_realtime_data()
     while True:
@@ -505,6 +616,8 @@ if __name__ == '__main__':
                 print(data)
                 raise socket.error
 
+            CPUCores = get_cpu_cores()
+            CPUModel = get_cpu_model()
             while True:
                 CPU = get_cpu()
                 NET_IN, NET_OUT = liuliang()
@@ -530,6 +643,8 @@ if __name__ == '__main__':
                 array['hdd_total'] = HDDTotal
                 array['hdd_used'] = HDDUsed
                 array['cpu'] = CPU
+                array['cpu_cores'] = CPUCores
+                array['cpu_model'] = CPUModel
                 array['network_rx'] = netSpeed.get("netrx")
                 array['network_tx'] = netSpeed.get("nettx")
                 array['network_in'] = NET_IN
@@ -543,34 +658,7 @@ if __name__ == '__main__':
                 array['tcp'], array['udp'], array['process'], array['thread'] = tupd()
                 array['io_read'] = diskIO.get("read")
                 array['io_write'] = diskIO.get("write")
-                # report OS (normalized)
-                try:
-                    sysname = platform.system().lower()
-                    if sysname.startswith('linux'):
-                        os_name = 'linux'
-                        # try distro from os-release
-                        try:
-                            with open('/etc/os-release') as f:
-                                for line in f:
-                                    if line.startswith('ID='):
-                                        val = line.strip().split('=',1)[1].strip().strip('"')
-                                        if val: os_name = val
-                                        break
-                        except Exception:
-                            pass
-                    elif sysname.startswith('darwin'):
-                        os_name = 'darwin'
-                    elif sysname.startswith('freebsd'):
-                        os_name = 'freebsd'
-                    elif sysname.startswith('openbsd'):
-                        os_name = 'openbsd'
-                    elif sysname.startswith('netbsd'):
-                        os_name = 'netbsd'
-                    else:
-                        os_name = sysname or 'unknown'
-                except Exception:
-                    os_name = 'unknown'
-                array['os'] = os_name
+                array['os'] = get_os_name()
                 items = []
                 for _n, st in monitorServer.items():
                     key = str(_n)

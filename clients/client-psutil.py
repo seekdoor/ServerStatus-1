@@ -32,6 +32,8 @@ import threading
 import platform
 from queue import Queue
 
+_net_io_counters_lock = threading.Lock()
+
 def _env_str(name, default):
     value = os.getenv(name)
     if value is None or value == "":
@@ -59,6 +61,14 @@ PING_PACKET_HISTORY_LEN = _env_int("PING_PACKET_HISTORY_LEN", PING_PACKET_HISTOR
 CU = _env_str("CU", CU)
 CT = _env_str("CT", CT)
 CM = _env_str("CM", CM)
+
+def parse_cli_args(arguments):
+    overrides = {}
+    for argument in arguments:
+        key, separator, value = argument.partition('=')
+        if separator and key in {'SERVER', 'PORT', 'USER', 'PASSWORD', 'INTERVAL'}:
+            overrides[key] = value
+    return overrides
 
 def get_uptime():
     return int(time.time() - psutil.boot_time())
@@ -92,15 +102,98 @@ def get_hdd():
 def get_cpu():
     return psutil.cpu_percent(interval=INTERVAL)
 
+def get_cpu_cores():
+    return psutil.cpu_count(logical=True) or 0
+
+def normalize_cpu_model(value):
+    return " ".join(str(value or "").split())[:160]
+
+def is_generic_cpu_model(value):
+    v = normalize_cpu_model(value).lower().replace('-', '').replace('_', '').replace(' ', '')
+    return v in ('', 'unknown', 'x8664', 'amd64', 'i386', 'i686', 'aarch64', 'arm64') or v.startswith('armv')
+
+def get_platform_cpu_vendor():
+    values = [
+        platform.processor(),
+        getattr(platform.uname(), 'processor', ''),
+        platform.machine(),
+        getattr(platform.uname(), 'machine', ''),
+        platform.platform(),
+    ]
+    text = " ".join(normalize_cpu_model(v).lower() for v in values)
+    if 'genuineintel' in text:
+        return 'GenuineIntel'
+    if 'authenticamd' in text:
+        return 'AuthenticAMD'
+    if 'intel' in text:
+        return 'Intel'
+    if 'amd' in text:
+        return 'AMD'
+    if sys.platform.startswith('darwin') and platform.machine().lower() in ('arm64', 'aarch64'):
+        return 'Apple'
+    if any(token in text for token in ('aarch64', 'arm64', 'armv7', 'armv8', ' arm ')):
+        return 'ARM'
+    return ''
+
+def get_platform_cpu_arch():
+    return normalize_cpu_model(platform.machine() or platform.processor() or platform.architecture()[0])
+
+def get_cpu_model():
+    for value in (platform.processor(), getattr(platform.uname(), 'processor', '')):
+        value = normalize_cpu_model(value)
+        if value and not is_generic_cpu_model(value):
+            return value
+    vendor = normalize_cpu_model(get_platform_cpu_vendor())
+    if vendor:
+        return vendor
+    return get_platform_cpu_arch()
+
+def get_os_name():
+    try:
+        sysname = platform.system().lower()
+        if sysname.startswith('windows'):
+            return 'windows'
+        if sysname.startswith('darwin') or 'mac' in sysname:
+            return 'darwin'
+        if 'bsd' in sysname:
+            return 'bsd'
+        if sysname.startswith('linux'):
+            os_name = 'linux'
+            try:
+                with open('/etc/os-release') as f:
+                    for line in f:
+                        if line.startswith('ID='):
+                            value = line.strip().split('=', 1)[1].strip().strip('"')
+                            if value:
+                                os_name = value
+                            break
+            except Exception:
+                pass
+            return os_name
+        return sysname or 'unknown'
+    except Exception:
+        return 'unknown'
+
+def _get_net_io_counters():
+    with _net_io_counters_lock:
+        return psutil.net_io_counters(pernic=True)
+
+def is_ignored_network_interface(name):
+    name = str(name or '').strip().lower()
+    is_loopback = (
+        name == 'lo'
+        or (name.startswith('lo') and name[2:].isdigit())
+        or name.startswith('loopback')
+    )
+    virtual_prefixes = ('tun', 'docker', 'veth', 'br-', 'vmbr', 'vnet', 'kube')
+    return not name or is_loopback or name.startswith(virtual_prefixes)
+
 def liuliang():
     NET_IN = 0
     NET_OUT = 0
-    net = psutil.net_io_counters(pernic=True)
+    net = _get_net_io_counters()
     for k, v in net.items():
-        if 'lo' in k or 'tun' in k \
-                or 'docker' in k or 'veth' in k \
-                or 'br-' in k or 'vmbr' in k \
-                or 'vnet' in k or 'kube' in k:
+        if is_ignored_network_interface(k):
             continue
         else:
             NET_IN += v[1]
@@ -176,6 +269,22 @@ diskIO = {
 }
 monitorServer = {}
 
+def update_net_speed(avgrx, avgtx, now_clock=None):
+    if now_clock is None:
+        now_clock = time.monotonic()
+    previous_clock = netSpeed.get("clock", 0.0)
+    previous_rx = netSpeed.get("avgrx", 0)
+    previous_tx = netSpeed.get("avgtx", 0)
+    diff = now_clock - previous_clock
+    initialized = previous_clock > 0 and diff > 0
+    netSpeed["diff"] = diff if initialized else 0.0
+    netSpeed["clock"] = now_clock
+    netSpeed["netrx"] = int((avgrx - previous_rx) / diff) if initialized and avgrx >= previous_rx else 0
+    netSpeed["nettx"] = int((avgtx - previous_tx) / diff) if initialized and avgtx >= previous_tx else 0
+    netSpeed["avgrx"] = avgrx
+    netSpeed["avgtx"] = avgtx
+    return netSpeed["netrx"], netSpeed["nettx"]
+
 def _ping_thread(host, mark, port):
     lostPacket = 0
     packet_queue = Queue(maxsize=PING_PACKET_HISTORY_LEN)
@@ -218,21 +327,12 @@ def _net_speed():
     while True:
         avgrx = 0
         avgtx = 0
-        for name, stats in psutil.net_io_counters(pernic=True).items():
-            if "lo" in name or "tun" in name \
-                    or "docker" in name or "veth" in name \
-                    or "br-" in name or "vmbr" in name \
-                    or "vnet" in name or "kube" in name:
+        for name, stats in _get_net_io_counters().items():
+            if is_ignored_network_interface(name):
                 continue
             avgrx += stats.bytes_recv
             avgtx += stats.bytes_sent
-        now_clock = time.time()
-        netSpeed["diff"] = now_clock - netSpeed["clock"]
-        netSpeed["clock"] = now_clock
-        netSpeed["netrx"] = int((avgrx - netSpeed["avgrx"]) / netSpeed["diff"])
-        netSpeed["nettx"] = int((avgtx - netSpeed["avgtx"]) / netSpeed["diff"])
-        netSpeed["avgrx"] = avgrx
-        netSpeed["avgtx"] = avgtx
+        update_net_speed(avgrx, avgtx)
         time.sleep(INTERVAL)
 
 def _disk_io():
@@ -410,17 +510,12 @@ def byte_str(object):
         print(type(object))
 
 if __name__ == '__main__':
-    for argc in sys.argv:
-        if 'SERVER' in argc:
-            SERVER = argc.split('SERVER=')[-1]
-        elif 'PORT' in argc:
-            PORT = int(argc.split('PORT=')[-1])
-        elif 'USER' in argc:
-            USER = argc.split('USER=')[-1]
-        elif 'PASSWORD' in argc:
-            PASSWORD = argc.split('PASSWORD=')[-1]
-        elif 'INTERVAL' in argc:
-            INTERVAL = int(argc.split('INTERVAL=')[-1])
+    cli_args = parse_cli_args(sys.argv[1:])
+    SERVER = cli_args.get('SERVER', SERVER)
+    PORT = int(cli_args.get('PORT', PORT))
+    USER = cli_args.get('USER', USER)
+    PASSWORD = cli_args.get('PASSWORD', PASSWORD)
+    INTERVAL = int(cli_args.get('INTERVAL', INTERVAL))
     socket.setdefaulttimeout(30)
     get_realtime_data()
     while 1:
@@ -472,6 +567,8 @@ if __name__ == '__main__':
                 print(data)
                 raise socket.error
 
+            CPUCores = get_cpu_cores()
+            CPUModel = get_cpu_model()
             while 1:
                 CPU = get_cpu()
                 NET_IN, NET_OUT = liuliang()
@@ -498,6 +595,8 @@ if __name__ == '__main__':
                 array['hdd_total'] = HDDTotal
                 array['hdd_used'] = HDDUsed
                 array['cpu'] = CPU
+                array['cpu_cores'] = CPUCores
+                array['cpu_model'] = CPUModel
                 array['network_rx'] = netSpeed.get("netrx")
                 array['network_tx'] = netSpeed.get("nettx")
                 array['network_in'] = NET_IN
@@ -511,31 +610,7 @@ if __name__ == '__main__':
                 array['tcp'], array['udp'], array['process'], array['thread'] = tupd()
                 array['io_read'] = diskIO.get("read")
                 array['io_write'] = diskIO.get("write")
-                # report OS (normalized)
-                try:
-                    sysname = platform.system().lower()
-                    if sysname.startswith('windows'):
-                        os_name = 'windows'
-                    elif sysname.startswith('darwin') or 'mac' in sysname:
-                        os_name = 'darwin'
-                    elif 'bsd' in sysname:
-                        os_name = 'bsd'
-                    elif sysname.startswith('linux'):
-                        # try distro from os-release
-                        try:
-                            with open('/etc/os-release') as f:
-                                for line in f:
-                                    if line.startswith('ID='):
-                                        val = line.strip().split('=',1)[1].strip().strip('"')
-                                        if val: os_name = val
-                                        break
-                        except Exception:
-                            os_name = 'linux'
-                    else:
-                        os_name = sysname or 'unknown'
-                except Exception:
-                    os_name = 'unknown'
-                array['os'] = os_name
+                array['os'] = get_os_name()
                 items = []
                 for _n, st in monitorServer.items():
                     key = str(_n)
